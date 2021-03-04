@@ -1,20 +1,16 @@
+using Mutagen.Bethesda.Core.Persistance;
 using Mutagen.Bethesda.Oblivion;
-using Noggog.Utility;
-using System;
 using System.Data;
 using Xunit;
 
 namespace Mutagen.Bethesda.UnitTests
 {
-    public abstract class IFormKeyAllocator_Tests
+    public abstract class IFormKeyAllocator_Tests<TFormKeyAllocator>
+        where TFormKeyAllocator : IFormKeyAllocator
     {
-        protected Lazy<TempFolder> tempFolder = new(() => TempFolder.FactoryByPath(path: Utility.TempFolderPath));
+        protected abstract TFormKeyAllocator CreateFormKeyAllocator(IMod mod);
 
-        protected Lazy<TempFile> tempFile = new(() => new TempFile(extraDirectoryPaths: Utility.TempFolderPath));
-
-        protected abstract IFormKeyAllocator CreateFormKeyAllocator(IMod mod);
-
-        protected abstract void DisposeFormKeyAllocator(IFormKeyAllocator allocator);
+        protected abstract void DisposeFormKeyAllocator(TFormKeyAllocator allocator);
 
         [Fact]
         public void CanAllocateNewFormKey()

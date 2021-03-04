@@ -1,4 +1,6 @@
+using Mutagen.Bethesda.Core.Persistance;
 using Mutagen.Bethesda.Oblivion;
+using Noggog.Utility;
 using System;
 using System.Collections.Concurrent;
 using System.Data;
@@ -7,11 +9,33 @@ using Xunit;
 
 namespace Mutagen.Bethesda.UnitTests
 {
-    public abstract class PersistentIFormKeyAllocator_Tests : IFormKeyAllocator_Tests
+    public abstract class IPersistentFormKeyAllocator_Tests<TFormKeyAllocator> : IFormKeyAllocator_Tests<TFormKeyAllocator>
+        where TFormKeyAllocator : IPersistentFormKeyAllocator
     {
-        protected abstract IFormKeyAllocator LoadFormKeyAllocator(IMod mod);
+        protected Lazy<TempFolder> tempFolder = new(() => TempFolder.FactoryByPath(path: Utility.TempFolderPath));
 
-        protected abstract void SaveFormKeyAllocator(IFormKeyAllocator allocator);
+        public void CanSaveAndLoad()
+        {
+            var mod = new OblivionMod(Utility.PluginModKey);
+            FormKey formKey;
+            { 
+                var allocator = CreateFormKeyAllocator(mod);
+
+                formKey = allocator.GetNextFormKey(Utility.Edid1);
+
+                allocator.Save();
+                DisposeFormKeyAllocator(allocator);
+            }
+
+            {
+                var allocator = CreateFormKeyAllocator(mod);
+
+                var loadedFormKey = allocator.GetNextFormKey(Utility.Edid1);
+                Assert.Equal(formKey, loadedFormKey);
+
+                DisposeFormKeyAllocator(allocator);
+            }
+        }
 
         [Fact]
         public void OutOfOrderAllocationReturnsSameIdentifiers()
@@ -28,12 +52,13 @@ namespace Mutagen.Bethesda.UnitTests
                 var formKey2 = allocator.GetNextFormKey(Utility.Edid2);
                 formID2 = formKey2.ID;
 
-                SaveFormKeyAllocator(allocator);
+                allocator.Save();
+                DisposeFormKeyAllocator(allocator);
             }
 
             {
                 var mod = new OblivionMod(Utility.PluginModKey);
-                var allocator = LoadFormKeyAllocator(mod);
+                var allocator = CreateFormKeyAllocator(mod);
 
                 var formKey2 = allocator.GetNextFormKey(Utility.Edid2);
                 Assert.Equal(formID2, formKey2.ID);
@@ -71,11 +96,13 @@ namespace Mutagen.Bethesda.UnitTests
 
                 input.AsParallel().ForAll(apply);
 
-                SaveFormKeyAllocator(allocator);
+                allocator.Save();
+
+                DisposeFormKeyAllocator(allocator);
             }
 
             {
-                var allocator = LoadFormKeyAllocator(mod);
+                var allocator = CreateFormKeyAllocator(mod);
 
                 void check((int i, string s) x)
                 {

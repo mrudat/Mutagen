@@ -13,32 +13,43 @@ namespace Mutagen.Bethesda.Core.Persistance
     /// 
     /// This class is made thread safe by locking internally on the Mod object.
     /// </summary>
-    public class TextFileFormKeyAllocator : IFormKeyAllocator
+    public class TextFileFormKeyAllocator : BasePersistentFormKeyAllocator, IPersistentFormKeyAllocator
     {
         private readonly Dictionary<string, FormKey> _cache = new();
 
-        private readonly HashSet<string> AllocatedEditorIDs = new();
-
-        /// <summary>
-        /// Associated Mod
-        /// </summary>
-        public IMod Mod { get; }
-
-        public TextFileFormKeyAllocator(IMod mod)
-        {
-            this.Mod = mod;
+        public TextFileFormKeyAllocator(IMod mod, string stateFolder) : base(mod, stateFolder) {
+            Load();
         }
 
-        private TextFileFormKeyAllocator(IMod mod, string filePath)
+        protected override FormKey _GetNextFormKey(string editorID)
         {
-            this.Mod = mod;
-            using var streamReader = new StreamReader(filePath);
+            lock (Mod)
+            {
+                if (_cache.TryGetValue(editorID, out var id))
+                    return id;
+
+                var formKey = GetNextFormKey();
+
+                _cache.Add(editorID, formKey);
+
+                return formKey;
+            }
+        }
+
+        private void Load()
+        {
+            var stateFilePath = Path.Combine(stateFolder, $"{Mod.ModKey.FileName}.txt");
+
+            if (!File.Exists(stateFilePath)) return;
+
+            var streamReader = new StreamReader(stateFilePath);
+
             var idLine = streamReader.ReadLine();
             if (!uint.TryParse(idLine, out var nextID))
             {
                 throw new ArgumentException($"Unconvertable next ID line: {idLine}");
             }
-            this.Mod.NextFormID = nextID;
+            Mod.NextFormID = nextID;
             while (true)
             {
                 var edidStr = streamReader.ReadLine();
@@ -53,83 +64,42 @@ namespace Mutagen.Bethesda.Core.Persistance
             }
         }
 
-        public static TextFileFormKeyAllocator FromFile(IMod mod, string filePath)
+        public override void Save()
         {
-            return new TextFileFormKeyAllocator(mod, filePath);
-        }
-
-        public static TextFileFormKeyAllocator FromFolder(IMod mod, string folderPath)
-        {
-            return new TextFileFormKeyAllocator(mod, Path.Combine(folderPath, mod.ModKey.FileName));
-        }
-
-        /// <summary>
-        /// Returns a FormKey with the next listed ID in the Mod's header.
-        /// No checks will be done that this is truly a unique key; It is assumed the header is in a correct state.
-        ///
-        /// The Mod's header will be incremented to mark the allocated key as "used".
-        /// </summary>
-        /// <returns>The next FormKey from the Mod</returns>
-        public FormKey GetNextFormKey()
-        {
-            lock (this.Mod)
-            {
-                return new FormKey(
-                    this.Mod.ModKey,
-                    checked(this.Mod.NextFormID++));
-            }
-        }
-
-        public FormKey GetNextFormKey(string? editorID)
-        {
-            if (editorID == null) return GetNextFormKey();
-
-            lock (this.Mod)
-            {
-                if (!AllocatedEditorIDs.Add(editorID))
-                    throw new ConstraintException($"Attempted to allocate a duplicate unique FormKey for {editorID}");
-
-                if (_cache.TryGetValue(editorID, out var id))
-                    return id;
-
-                var formKey = GetNextFormKey();
-
-                _cache.Add(editorID, formKey);
-
-                return formKey;
-            }
-        }
-
-        public static void WriteToFile(string path, uint nextID, IEnumerable<KeyValuePair<string, FormKey>> edidFormKeyPairs)
-        {
-            using var streamWriter = new StreamWriter(path);
-            streamWriter.WriteLine(nextID.ToString());
-            foreach (var pair in edidFormKeyPairs)
-            {
-                streamWriter.WriteLine(pair.Key);
-                streamWriter.WriteLine(pair.Value);
-            }
-        }
-
-        public void WriteToFile(string path)
-        {
-            WriteToFile(path,this.Mod.NextFormID, _cache);
-        }
-
-        [Obsolete("Please use the method WriteToFile(path) instead")]
-        public static void WriteToFile(string path, IModGetter mod)
-        {
-            WriteToFile(
-                path,
-                mod.NextFormID,
-                mod.EnumerateMajorRecords()
-                    .SelectWhere(m =>
+            var stateFile = Path.Combine(stateFolder, $"{Mod.ModKey.FileName}.txt");
+            var tempFile = Path.Combine(stateFolder, $"{Mod.ModKey.FileName}.tmp");
+            try {
+                {
+                    using var streamWriter = new StreamWriter(tempFile);
+                    streamWriter.WriteLine(Mod.NextFormID.ToString());
+                    foreach (var pair in _cache)
                     {
-                        var edid = m.EditorID;
-                        if (edid == null) return TryGet<KeyValuePair<string, FormKey>>.Failure;
-                        return TryGet<KeyValuePair<string, FormKey>>.Succeed(
-                            new KeyValuePair<string, FormKey>(edid, m.FormKey));
-                    }));
+                        streamWriter.WriteLine(pair.Key);
+                        streamWriter.WriteLine(pair.Value);
+                    }
+                }
+                File.Move(tempFile, stateFile, true);
+            }
+            finally
+            {
+                if (File.Exists(tempFile))
+                    File.Delete(tempFile);
+            }
+        }
+
+        public override void Export(IPersistentFormKeyAllocator newAllocator)
+        {
+            newAllocator.Import(_cache);
+        }
+
+        public override void Import(IEnumerable<KeyValuePair<string, FormKey>> oldData)
+        {
+            foreach (var (editorID, formKey) in oldData)
+            {
+                if (formKey.ModKey != Mod.ModKey)
+                    throw new ArgumentException($"Attempted to import formKey from foreign mod {formKey.ModKey}");
+                _cache.Add(editorID, formKey);
+            }
         }
     }
 }

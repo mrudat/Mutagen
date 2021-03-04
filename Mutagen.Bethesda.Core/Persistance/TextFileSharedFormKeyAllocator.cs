@@ -12,31 +12,97 @@ namespace Mutagen.Bethesda.Core.Persistance
     /// 
     /// This class is made thread safe by locking internally on the Mod object.
     /// </summary>
-    [DebuggerDisplay("TextFileFormKeyAllocatorv2 {patcherName}")]
-    public class TextFileSharedFormKeyAllocator : IFormKeyAllocator, ISharedFormKeyAllocator
+    public class TextFileSharedFormKeyAllocator : BaseSharedFormKeyAllocator, ISharedFormKeyAllocator
     {
         private readonly Dictionary<string, (string patcherName, FormKey formKey)> _cache = new();
 
-        private readonly HashSet<string> allocatedEditorIDs = new();
-
         private readonly HashSet<uint> FormIDSet = new();
 
-        private readonly string patcherName;
+        public TextFileSharedFormKeyAllocator(IMod mod, string stateFolder) : this(mod, stateFolder, DefaultPatcherName) { }
 
-        /// <summary>
-        /// Associated Mod
-        /// </summary>
-        public IMod Mod { get; }
-
-        public TextFileSharedFormKeyAllocator(IMod mod) : this(mod, "") { }
-
-        public TextFileSharedFormKeyAllocator(IMod mod, string patcherName)
+        public TextFileSharedFormKeyAllocator(IMod mod, string stateFolder, string patcherName) : base(mod, stateFolder)
         {
-            this.Mod = mod;
-            this.patcherName = patcherName;
+            Load();
         }
 
-        private void ReadFile(string filePath, string patcherName)
+        public override FormKey GetNextFormKey()
+        {
+            lock (Mod)
+            {
+                var candidateFormID = Mod.NextFormID;
+                if (candidateFormID > 0xFFFFFF)
+                    throw new OverflowException();
+
+                while (FormIDSet.Contains(candidateFormID))
+                {
+                    candidateFormID++;
+                    if (candidateFormID > 0xFFFFFF)
+                        throw new OverflowException();
+                }
+
+                Mod.NextFormID = candidateFormID + 1;
+
+                return new FormKey(Mod.ModKey, candidateFormID);
+            }
+        }
+
+        protected override FormKey _GetNextFormKey(string editorID)
+        {
+            lock (_cache)
+            {
+                if (_cache.TryGetValue(editorID, out var rec))
+                {
+                    if (rec.patcherName != this.patcherName)
+                        throw new ConstraintException($"Attempted to allocate a unique FormKey for {editorID} when it was previously allocated by {rec.patcherName}");
+                    return rec.formKey;
+                }
+
+                var formKey = GetNextFormKey();
+
+                _cache.Add(editorID, (patcherName, formKey));
+
+                return formKey;
+            }
+        }
+
+        public override void Save()
+        {
+            var stateDirectory = Path.Combine(stateFolder, $"{Mod.ModKey.FileName}.d");
+
+            var data = this._cache
+                .Where(p => p.Value.patcherName == patcherName)
+                .Select(p => (p.Key, p.Value.formKey));
+
+            var stateFile = Path.Combine(stateDirectory, $"{patcherName}.txt");
+            var tempFile = Path.Combine(stateDirectory, $"{patcherName}.tmp");
+            try
+            {
+                using var streamWriter = new StreamWriter(tempFile);
+                foreach (var (Key, Value) in data)
+                {
+                    streamWriter.WriteLine(Key);
+                    streamWriter.WriteLine(Value);
+                }
+                File.Move(tempFile, stateFile);
+            }
+            finally
+            {
+                if (File.Exists(tempFile))
+                    File.Delete(tempFile);
+            }
+        }
+
+        private void Load()
+        {
+            var stateDirectory = Path.Combine(stateFolder, $"{Mod.ModKey.FileName}.d");
+            if (!Directory.Exists(stateDirectory))
+                return;
+
+            foreach (var file in Directory.EnumerateFiles(stateDirectory, "*.txt"))
+                LoadFile(file, Path.GetFileName(file)[0..^4]);
+        }
+
+        private void LoadFile(string filePath, string patcherName)
         {
             using var streamReader = new StreamReader(filePath);
             while (true)
@@ -57,107 +123,58 @@ namespace Mutagen.Bethesda.Core.Persistance
             }
         }
 
-        public static TextFileSharedFormKeyAllocator FromFile(IMod mod, string filePath)
+        public override void Export(IPersistentFormKeyAllocator newAllocator)
         {
-            // should it be okay to read from an empty/missing file?
-            var self = new TextFileSharedFormKeyAllocator(mod, "");
-            self.ReadFile(filePath, self.patcherName);
-            return self;
+            var data =
+                from kpv in _cache
+                select new KeyValuePair<string,FormKey>(kpv.Key, kpv.Value.formKey);
+            newAllocator.Import(data);
         }
 
-        public static TextFileSharedFormKeyAllocator FromFolder(IMod mod, string folderPath, string patcherName)
+        public override void Import(string patcherName, IEnumerable<KeyValuePair<string, FormKey>> oldData)
         {
-            var self = new TextFileSharedFormKeyAllocator(mod, patcherName);
-            foreach (var file in Directory.GetFiles(folderPath))
-                self.ReadFile(file, Path.GetFileName(file));
-            return self;
-        }
-
-        /// <summary>
-        /// Returns a FormKey with the next listed ID in the Mod's header.
-        /// No checks will be done that this is truly a unique key; It is assumed the header is in a correct state.
-        ///
-        /// The Mod's header will be incremented to mark the allocated key as "used".
-        /// </summary>
-        /// <returns>The next FormKey from the Mod</returns>
-        public FormKey GetNextFormKey()
-        {
-            lock (this.Mod)
+            foreach (var (editorID, formKey) in oldData)
             {
-                var candidateFormID = this.Mod.NextFormID;
-                if (candidateFormID > 0xFFFFFF)
-                    throw new OverflowException();
-
-                while (FormIDSet.Contains(candidateFormID))
-                {
-                    candidateFormID++;
-                    if (candidateFormID > 0xFFFFFF)
-                        throw new OverflowException();
-                }
-
-                Mod.NextFormID = candidateFormID + 1;
-
-                return new FormKey(
-                    this.Mod.ModKey,
-                    checked(candidateFormID));
-            }
-        }
-
-        public FormKey GetNextFormKey(string? editorID)
-        {
-            if (editorID == null) return GetNextFormKey();
-
-            lock (_cache)
-            {
-                if (!allocatedEditorIDs.Add(editorID))
-                    throw new ConstraintException($"Attempted to allocate a duplicate unique FormKey for {editorID}");
-
-                if (_cache.TryGetValue(editorID, out var rec))
-                {
-                    if (rec.patcherName != this.patcherName)
-                        throw new ConstraintException($"Attempted to allocate a unique FormKey for {editorID} when it was previously allocated by {rec.patcherName}");
-                    return rec.formKey;
-                }
-
-                var formKey = GetNextFormKey();
-
+                if (formKey.ModKey != Mod.ModKey)
+                    throw new ArgumentException($"Attempted to import formKey from foreign mod {formKey.ModKey}");
                 _cache.Add(editorID, (patcherName, formKey));
-
-                return formKey;
+                if (!FormIDSet.Add(formKey.ID))
+                    throw new ArgumentException("Attempted to import duplicate formKey");
             }
         }
 
-        internal static void WriteToFile(string path, IEnumerable<(string Key, FormKey Value)> edidFormKeyPairs)
+        public override void Export(ISharedFormKeyAllocator newAllocator)
         {
-            using var streamWriter = new StreamWriter(path);
-            foreach (var (Key, Value) in edidFormKeyPairs)
+            var data =
+                from kpv in _cache
+                select (kpv.Key, kpv.Value.patcherName, kpv.Value.formKey);
+            newAllocator.Import(data);
+        }
+
+        internal void Import((string, FormKey)[] oldData)
+        {
+            foreach (var (editorID, formKey) in oldData)
             {
-                streamWriter.WriteLine(Key);
-                streamWriter.WriteLine(Value);
+                if (formKey.ModKey != Mod.ModKey)
+                    throw new ArgumentException($"Attempted to import formKey from foreign mod {formKey.ModKey}");
+                _cache.Add(editorID, (DefaultPatcherName, formKey));
+                if (!FormIDSet.Add(formKey.ID))
+                    throw new ArgumentException("Attempted to import duplicate formKey");
             }
         }
 
-        public void WriteToFile(string path)
+        public override void Import(IEnumerable<(string, string, FormKey)> oldData)
         {
-            if (patcherName != "")
-                throw new InvalidOperationException("Use WriteToFolder instead.");
-
-            var data = this._cache
-                .Select(p => (p.Key, p.Value.formKey));
-
-            WriteToFile(path, data);
+            foreach (var (editorID, patcherName, formKey) in oldData)
+            {
+                if (formKey.ModKey != Mod.ModKey)
+                    throw new ArgumentException($"Attempted to import formKey from foreign mod {formKey.ModKey}");
+                _cache.Add(editorID, (patcherName, formKey));
+                if(!FormIDSet.Add(formKey.ID))
+                    throw new ArgumentException("Attempted to import duplicate formKey");
+            }
         }
 
-        public void WriteToFolder(string path)
-        {
-            if (patcherName == "")
-                throw new InvalidOperationException("Use WriteToFile instead.");
 
-            var data = this._cache
-                .Where(p => p.Value.patcherName == patcherName)
-                .Select(p => (p.Key, p.Value.formKey));
-
-            WriteToFile(Path.Combine(path, patcherName), data);
-        }
     }
 }

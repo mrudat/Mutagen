@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Data;
 using System.Diagnostics;
+using System.IO;
 using System.Linq;
 using Microsoft.EntityFrameworkCore;
 
@@ -55,33 +56,28 @@ namespace Mutagen.Bethesda.Core.Persistance
 
     }
 
-    public class SQLiteFormKeyAllocator : IFormKeyAllocator, IDisposable, ISharedFormKeyAllocator
+    public class SQLiteFormKeyAllocator : BaseSharedFormKeyAllocator, IDisposable, ISharedFormKeyAllocator
     {
-        private readonly IMod Mod;
-
         private readonly uint PatcherID;
 
         private readonly SQLiteFormKeyAllocatorDbContext Connection;
 
         private bool disposedValue;
 
-        private HashSet<string> AllocatedEditorIDs = new();
-
         private readonly bool manyPatchers = true;
 
-        public SQLiteFormKeyAllocator(IMod mod, string dbPath) : this(mod, dbPath, "")
+        public SQLiteFormKeyAllocator(IMod mod, string stateFolder) : this(mod, stateFolder, DefaultPatcherName)
         {
             manyPatchers = false;
         }
 
-        public SQLiteFormKeyAllocator(IMod mod, string dbPath, string patcherName)
+        public SQLiteFormKeyAllocator(IMod mod, string stateFolder, string patcherName) : base(mod, stateFolder)
         {
-            Mod = mod;
-            Connection = new SQLiteFormKeyAllocatorDbContext(dbPath);
+            Connection = new SQLiteFormKeyAllocatorDbContext(Path.Combine(stateFolder, $"{Mod.ModKey.FileName}.sqlite"));
             PatcherID = GetOrAddPatcherID(patcherName);
         }
 
-        public FormKey GetNextFormKey()
+        public override FormKey GetNextFormKey()
         {
             lock (Connection)
             {
@@ -107,15 +103,10 @@ namespace Mutagen.Bethesda.Core.Persistance
             }
         }
 
-        public FormKey GetNextFormKey(string? editorID)
+        protected override FormKey _GetNextFormKey(string editorID)
         {
-            if (editorID == null) return GetNextFormKey();
-
             lock (Connection)
             {
-                if (!AllocatedEditorIDs.Add(editorID))
-                    throw new ConstraintException($"Attempted to allocate a duplicate unique FormKey for {editorID}");
-
                 // should be $"select EditorID, FormID, PatcherID from FormIDs where EditorID = {editorID}"
                 var rec = Connection.FormIDs.AsNoTracking().FirstOrDefault(r => r.EditorID == editorID);
 
@@ -183,20 +174,12 @@ namespace Mutagen.Bethesda.Core.Persistance
             }
         }
 
-        public void Commit()
-        {
-            lock (Connection)
-            {
-                Connection.SaveChanges();
-            }
-        }
-
         protected virtual void Dispose(bool disposing)
         {
             if (disposedValue) return;
             if (disposing)
                 Connection?.Dispose();
-            AllocatedEditorIDs = null!;
+            AllocatedEditorIDs?.Clear();
             disposedValue = true;
         }
 
@@ -209,6 +192,102 @@ namespace Mutagen.Bethesda.Core.Persistance
         {
             Dispose(disposing: true);
             GC.SuppressFinalize(this);
+        }
+
+        public override void Save()
+        {
+            lock (Connection)
+            {
+                Connection.SaveChanges();
+            }
+        }
+
+        public override void Export(ISharedFormKeyAllocator newAllocator)
+        {
+            lock (Connection)
+            {
+                var data = (
+                    from rec in Connection.FormIDs
+                    join p in Connection.Patchers
+                      on rec.PatcherID equals p.PatcherID
+                    select new { rec.EditorID, p.PatcherName, FormKey = Mod.ModKey.MakeFormKey(rec.FormID) }
+                )
+                .ToList() // TODO make this less bad.
+                .Select(r => (r.EditorID, r.PatcherName, r.FormKey))
+                ;
+
+                newAllocator.Import(data);
+            }
+        }
+
+        public void Export(SQLiteFormKeyAllocator newAllocator)
+        {
+            lock (Connection)
+            {
+                var data = 
+                    from rec in Connection.FormIDs
+                    join p in Connection.Patchers
+                      on rec.PatcherID equals p.PatcherID
+                    group new KeyValuePair<string,uint>(rec.EditorID,rec.FormID) by p.PatcherName
+                ;
+
+                newAllocator.Import(data);
+            }
+        }
+
+        private void Import(IQueryable<IGrouping<string, KeyValuePair<string, uint>>> oldData)
+        {
+            lock (Connection)
+            {
+                foreach (var patcherData in oldData)
+                {
+                    var patcherID = GetOrAddPatcherID(patcherData.Key);
+                    foreach (var (editorID, formID) in patcherData)
+                    {
+                        Connection.FormIDs.Add(new(editorID, patcherID, formID));
+                    }
+                }
+            }
+        }
+
+        public override void Import(IEnumerable<(string, string, FormKey)> oldData)
+        {
+            lock (Connection)
+            {
+                foreach (var (editorID, patcherName, formKey) in oldData)
+                {
+                    if (formKey.ModKey != Mod.ModKey)
+                        throw new ArgumentException($"Attempted to import formKey from foreign mod {formKey.ModKey}");
+                    var patcherID = GetOrAddPatcherID(patcherName);
+                    Connection.FormIDs.Add(new(editorID, patcherID, formKey.ID));
+                }
+            }
+        }
+         
+        public override void Export(IPersistentFormKeyAllocator newAllocator)
+        {
+            lock (Connection)
+            {
+                var data =
+                from rec in Connection.FormIDs
+                select new KeyValuePair<string, FormKey>(rec.EditorID, Mod.ModKey.MakeFormKey(rec.FormID));
+                
+                newAllocator.Import(data);
+            }
+        }
+
+        public override void Import(string patcherName, IEnumerable<KeyValuePair<string, FormKey>> oldData)
+        {
+            lock (Connection)
+            {
+                var patcherID = GetOrAddPatcherID(patcherName);
+                foreach (var (editorID, formKey) in oldData)
+                {
+                    if (formKey.ModKey != Mod.ModKey)
+                        throw new ArgumentException($"Attempted to import formKey from foreign mod {formKey.ModKey}");
+                    Connection.FormIDs.Add(new(editorID, patcherID, formKey.ID));
+                }
+            }
         }
     }
 }

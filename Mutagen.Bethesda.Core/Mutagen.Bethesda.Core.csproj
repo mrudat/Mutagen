@@ -134,6 +134,10 @@
     <Compile Include="Load Order\LoadOrderListing.cs" />
     <Compile Include="Load Order\LoadOrderTimestampComparer.cs" />
     <Compile Include="Load Order\PluginListings.cs" />
+    <Compile Include="Persistance\BaseFormKeyAllocator.cs" />
+    <Compile Include="Persistance\BasePersistentFormKeyAllocator.cs" />
+    <Compile Include="Persistance\BaseSharedFormKeyAllocator.cs" />
+    <Compile Include="Persistance\IPersistentFormKeyAllocator.cs" />
     <Compile Include="Persistance\ISharedFormKeyAllocator.cs" />
     <Compile Include="Persistance\TextFileSharedFormKeyAllocator.cs" />
     <Compile Include="Persistance\SQLiteFormKeyAllocator.cs" />
